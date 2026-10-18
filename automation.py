@@ -12,6 +12,7 @@ import unicodedata
 TZ = dt.timezone(dt.timedelta(hours=8))
 # Conservative defaults protect the accounts: X restricts accounts that reply at high volume.
 MIN_INTERVAL, MAX_HOUR, MAX_DAY, AUTHOR_COOLDOWN_DAYS = 600, 4, 20, 7
+NO_MATCH_RETRY, TRANSIENT_RETRY, MAX_TRANSIENT_FAILURES = 600, 900, 4
 DEFAULT_RULE = dict(tags="", match_mode="all", exclude="", query="", interval=1800,
                     start_time="09:00", end_time="23:00", hour_limit=2, day_limit=10,
                     tone="用中文自然回应原帖的具体观点，15到65字，不推销、不编造经历。", publish_mode="auto")
@@ -123,6 +124,7 @@ class AutomationManager:
     def __init__(self, **dependencies):
         self.__dict__.update(dependencies)
         self.running = set()
+        self.failures = {}
         self.guard = threading.RLock()
         self.executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="x-account")
         with self.db() as con:
@@ -300,6 +302,11 @@ class AutomationManager:
                 return
             keywords = [term for group in groups(rule["tags"]) for term in group]
             query = rule["query"] or "(" + " OR ".join('"' + re.sub(r'["\\]', '', term) + '"' for term in keywords[:12]) + ")"
+            # Ask X for blue-verified original posts only, so each round's few profile checks are not wasted.
+            if "filter:blue_verified" not in query:
+                query += " filter:blue_verified"
+            if "filter:replies" not in query:
+                query += " -filter:replies"
             self.update(client_id, status="正在寻找候选帖子；尚未发布")
             candidates = self.call(client_id, "scan", dict(source="search", query=query)).get("posts", [])[:60]
             own_handles = {normalize(s["account"]) for s in self.pool.listing() if s["account"]}
@@ -408,13 +415,26 @@ class AutomationManager:
                 self.log("@" + handle + " 已评论 @" + author + "；" + reason)
                 sent = True
                 break
+            self.failures.pop(client_id, None)
             if not sent and reserved is None and self.still_enabled(client_id, revision):
-                self.update(client_id, status="本轮没有符合蓝 V + 主页标签的未评论帖子")
+                # Nothing was posted, so look again sooner; browsing search is not a comment.
+                self.update(client_id, status="本轮没有符合蓝 V + 主页标签的未评论帖子，稍后再找",
+                            next_run=time.time() + min(int(rule["interval"]), NO_MATCH_RETRY))
         except Exception as exc:
             message = str(exc)[:500]
             if reserved:
                 self.update_post(reserved, status="uncertain" if dispatched else "failed", error=message)
                 self.report(account["handle"], account["rule"].get("publish_mode", "auto"), reserved, "", outcome=("结果待核对：" if dispatched else "失败：") + message)
+            transient = not dispatched and "X_WARNING" not in message and "账号已变化" not in message and "未登录" not in message
+            count = self.failures.get(client_id, 0) + 1
+            self.failures[client_id] = count
+            if transient and count < MAX_TRANSIENT_FAILURES:
+                # A timeout or a page that loaded slowly should not stop the account all night.
+                self.update(client_id, status=f"本轮出错（第 {count} 次），{TRANSIENT_RETRY // 60} 分钟后自动重试；未发布",
+                            last_error=message, next_run=time.time() + TRANSIENT_RETRY)
+                self.log("账号本轮出错，稍后重试：" + (account["handle"] or client_id[:8]) + "；" + message)
+                return
+            self.failures.pop(client_id, None)
             self.update(client_id, enabled=0, status="已暂停，请检查原因后重新启动", last_error=message)
             if "X_WARNING" in message:
                 # Accounts share this machine and network; one warning means stop everything.
