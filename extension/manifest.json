@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "X 评论助手 · 已登录浏览器连接器",
+  "version": "2.0.0",
+  "description": "连接本机多账号评论助手，按每个账号的蓝 V、博主主页标签和时间规则自动评论，也支持手动确认。",
+  "permissions": ["scripting", "storage"],
+  "host_permissions": ["https://x.com/*", "http://127.0.0.1/*"],
+  "action": {"default_popup": "popup.html", "default_title": "连接当前 X 标签页"},
+  "content_security_policy": {"extension_pages": "script-src 'self'; object-src 'self'; connect-src http://127.0.0.1:*"}
+}

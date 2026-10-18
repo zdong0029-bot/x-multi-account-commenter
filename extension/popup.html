@@ -1,0 +1,8 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>连接 X 评论助手</title>
+<style>body{width:320px;padding:18px;font:13px/1.7 'Segoe UI','Microsoft YaHei',sans-serif;background:#f5f5ee;color:#202827}h2{font-size:18px;margin:0 0 8px}label{display:block;margin:12px 0 4px}input,button{box-sizing:border-box;width:100%;padding:10px;border:1px solid #cfd5c8;border-radius:7px;font:inherit}button{margin-top:16px;background:#365e49;color:white;cursor:pointer}p{color:#697463;font-size:12px}#error{color:#a83c31}</style>
+<h2>连接当前 X 标签页</h2><p>先切到已登录的 x.com 页面，再打开本扩展。无需填写账号密码。</p>
+<label for="url">本机助手地址</label><input id="url" value="http://127.0.0.1:18865">
+<label for="code">面板上显示的配对码</label><input id="code" placeholder="12 位配对码" autocomplete="off" maxlength="12">
+<label for="label">这个账号的备注（可选）</label><input id="label" placeholder="例如：AI 工具号 / 旅行号" maxlength="60"><p>多个账号同时运行时，每个账号使用独立的 Chrome / Edge 用户配置，并各自加载本扩展。</p>
+<button id="connect">连接这个 X 标签页</button><p id="error" role="status"></p>
+<script src="popup.js"></script></html>
