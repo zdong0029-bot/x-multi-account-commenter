@@ -6,6 +6,13 @@
   async function until(getter,deadline,ms=15000){const end=Math.min(deadline,Date.now()+ms);while(Date.now()<end){const value=getter();if(value)return value;await sleep(180);}throw Error('未找到页面控件，请确认 X 已加载且当前账号有权操作。');}
   function account(){return (document.querySelector('a[data-testid="AppTabBar_Profile_Link"]')?.getAttribute('href')||'').replace(/^\/+|\/+$/g,'');}
   function loginError(){const text=document.body.innerText;if(/(temporarily limited your login|临时限制你的登录|臨時限制你的登入)/i.test(text))throw Error('X 暂时限制了这次登录。请停止重复尝试，继续使用原本已登录的标签页。');}
+  // X risk-control signals. Seen in toasts, alerts, dialogs or the account-access pages.
+  const WARN=/(rate limit|over the daily limit|looks like it might be automated|unusual activity|account (is|has been) (temporarily )?(locked|restricted|suspended)|verify (you are|you're) human|complete a challenge|异常活动|看起来像是自动|已被锁定|已被冻结|已被限制|暂时受限|超出.{0,6}限制|完成验证)/i;
+  function xWarning(){
+    if(/^\/account\/(access|suspended|locked)/.test(location.pathname)||document.querySelector('iframe[src*="arkoselabs"],iframe[src*="captcha"]'))return 'X 要求验证或账号受限（'+location.pathname+'）';
+    const text=Array.from(document.querySelectorAll('[data-testid="toast"],[role="alert"],[role="dialog"]')).map(el=>el.innerText).join(' ');
+    const m=text.match(WARN);return m?('X 提示：'+text.slice(Math.max(0,m.index-40),m.index+80).replace(/\s+/g,' ')):'';
+  }
   function badge(root){
     if(!root)return {badge:'unknown',badge_evidence:'未找到作者标记区域'};
     const icon=root.querySelector('svg[data-testid="icon-verified"]');
@@ -21,6 +28,7 @@
   async function run(command,args,deadline){
     let clicked=false;
     try{
+      {const w=xWarning();if(w)throw Error('X_WARNING '+w);}
       if(!account())loginError();
       await until(()=>account(),deadline,12000);
       if(command==='info')return {ok:true,account:account()};
@@ -72,6 +80,7 @@
           const sent=extract().find(post=>post.text.trim()===args.text&&new URL(post.url||'https://x.com').pathname.startsWith('/'+args.account+'/status/')&&!post.url.endsWith('/status/'+args.id));
           if(sent)return {ok:true,clicked:true,sent:true,reply_url:sent.url};
         }
+        {const w=xWarning();if(w)throw Error('X_WARNING 已点击发送后出现风控提示：'+w);}
         await sleep(400);
       }
       throw Error('已点击发送，但结果未能确认。请在 X 检查，助手不会自动重发。');
