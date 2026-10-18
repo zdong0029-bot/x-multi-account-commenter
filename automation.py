@@ -8,8 +8,10 @@ import time
 import unicodedata
 
 TZ = dt.timezone(dt.timedelta(hours=8))
-DEFAULT_RULE = dict(tags="", match_mode="all", exclude="", query="", interval=300,
-                    start_time="00:00", end_time="00:00", hour_limit=0, day_limit=0,
+# Conservative defaults protect the accounts: X restricts accounts that reply at high volume.
+MIN_INTERVAL, MAX_HOUR, MAX_DAY, AUTHOR_COOLDOWN_DAYS = 600, 4, 20, 7
+DEFAULT_RULE = dict(tags="", match_mode="all", exclude="", query="", interval=1800,
+                    start_time="09:00", end_time="23:00", hour_limit=2, day_limit=10,
                     tone="用中文自然回应原帖的具体观点，15到65字，不推销、不编造经历。")
 
 
@@ -58,12 +60,13 @@ def validate_rule(values):
     for key in ("tags", "exclude", "query", "tone"):
         rule[key] = str(rule[key]).strip()[:2000]
     rule["interval"] = int(rule["interval"])
-    if not 30 <= rule["interval"] <= 86400:
-        raise ValueError("每个账号的评论间隔应在 30 秒到 86400 秒之间。")
-    for key in ("hour_limit", "day_limit"):
-        rule[key] = int(rule[key])
-        if not 0 <= rule[key] <= 10000:
-            raise ValueError("条数上限应为 0 到 10000，0 表示不额外限制。")
+    if not MIN_INTERVAL <= rule["interval"] <= 86400:
+        raise ValueError(f"为保护账号，评论间隔应在 {MIN_INTERVAL} 秒到 86400 秒之间。")
+    rule["hour_limit"], rule["day_limit"] = int(rule["hour_limit"]), int(rule["day_limit"])
+    if not 1 <= rule["hour_limit"] <= MAX_HOUR:
+        raise ValueError(f"为保护账号，每小时上限应为 1 到 {MAX_HOUR} 条。")
+    if not 1 <= rule["day_limit"] <= MAX_DAY:
+        raise ValueError(f"为保护账号，每天上限应为 1 到 {MAX_DAY} 条。")
     if rule["match_mode"] not in {"all", "any"}:
         raise ValueError("无效标签匹配方式")
     for key in ("start_time", "end_time"):
@@ -267,6 +270,12 @@ class AutomationManager:
                 with self.db() as con:
                     if con.execute("SELECT 1 FROM posts WHERE id=?", (post_id,)).fetchone():
                         continue
+                # Never let any of your accounts reply to the same blogger again within the cooldown:
+                # several accounts swarming one author looks coordinated and gets reported.
+                with self.db() as con:
+                    if con.execute("SELECT 1 FROM posts WHERE lower(url) LIKE lower(?) AND status IN ('sent','sending','uncertain') AND COALESCE(published,created)>=? LIMIT 1",
+                                   ("https://x.com/" + author + "/status/%", time.time() - AUTHOR_COOLDOWN_DAYS * 86400)).fetchone():
+                        continue
                 # An explicit non-blue badge can be discarded without opening a profile.
                 if candidate.get("badge") in {"gold", "grey", "none"}:
                     continue
@@ -339,6 +348,11 @@ class AutomationManager:
             if reserved:
                 self.update_post(reserved, status="uncertain" if dispatched else "failed", error=message)
             self.update(client_id, enabled=0, status="已暂停，请检查原因后重新启动", last_error=message)
+            if "X_WARNING" in message:
+                # Accounts share this machine and network; one warning means stop everything.
+                with self.db() as con:
+                    con.execute("UPDATE automation_accounts SET enabled=0,status='X 出现风控提示，已暂停全部账号；请人工检查后再启动' WHERE enabled=1")
+                self.log("检测到 X 风控提示，已暂停全部账号：" + message)
             self.log("账号自动评论已暂停：" + (account["handle"] or client_id[:8]) + "；" + message)
         finally:
             current = self.record(client_id)
