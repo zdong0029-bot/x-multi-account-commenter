@@ -1,6 +1,8 @@
 """Per-account rules and scheduling. Public profile evidence is checked before sending."""
 from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
+import csv
+import difflib
 import json
 import re
 import threading
@@ -12,7 +14,9 @@ TZ = dt.timezone(dt.timedelta(hours=8))
 MIN_INTERVAL, MAX_HOUR, MAX_DAY, AUTHOR_COOLDOWN_DAYS = 600, 4, 20, 7
 DEFAULT_RULE = dict(tags="", match_mode="all", exclude="", query="", interval=1800,
                     start_time="09:00", end_time="23:00", hour_limit=2, day_limit=10,
-                    tone="用中文自然回应原帖的具体观点，15到65字，不推销、不编造经历。")
+                    tone="用中文自然回应原帖的具体观点，15到65字，不推销、不编造经历。", publish_mode="auto")
+PUBLISH_MODES = {"auto", "review", "dry"}  # auto: 自动发布; review: 生成草稿人工确认; dry: 只筛选+生成，不发布
+SIMILARITY_LIMIT = 0.8  # 与近期已发评论相似度超过此值视为模板化，跳过
 
 
 def normalize(value):
@@ -54,6 +58,32 @@ def match_profile(profile, rule):
     return True, "蓝 V；主页命中：" + "、".join("/".join(hit) for hit in hits if hit)
 
 
+def migrate_rule(values):
+    """旧版规则（0 = 不限、30 秒间隔）自动收紧到账号保护范围内，而不是拒绝启动。"""
+    rule = dict(DEFAULT_RULE)
+    rule.update({k: v for k, v in dict(values or {}).items() if k in rule})
+    try:
+        rule["interval"] = min(86400, max(MIN_INTERVAL, int(rule["interval"])))
+        rule["hour_limit"] = int(rule["hour_limit"]) or DEFAULT_RULE["hour_limit"]
+        rule["day_limit"] = int(rule["day_limit"]) or DEFAULT_RULE["day_limit"]
+    except (TypeError, ValueError):
+        return dict(DEFAULT_RULE, tags=rule.get("tags", ""))
+    rule["hour_limit"] = min(MAX_HOUR, max(1, rule["hour_limit"]))
+    rule["day_limit"] = min(MAX_DAY, max(1, rule["day_limit"]))
+    if rule.get("publish_mode") not in PUBLISH_MODES:
+        rule["publish_mode"] = "auto"
+    return rule
+
+
+def too_similar(draft, previous):
+    a = normalize(draft)
+    return any(difflib.SequenceMatcher(None, a, normalize(p)).ratio() >= SIMILARITY_LIMIT for p in previous if p)
+
+
+def like_escape(value):
+    return str(value).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def validate_rule(values):
     rule = dict(DEFAULT_RULE)
     rule.update({k: v for k, v in values.items() if k in rule})
@@ -67,6 +97,8 @@ def validate_rule(values):
         raise ValueError(f"为保护账号，每小时上限应为 1 到 {MAX_HOUR} 条。")
     if not 1 <= rule["day_limit"] <= MAX_DAY:
         raise ValueError(f"为保护账号，每天上限应为 1 到 {MAX_DAY} 条。")
+    if rule["publish_mode"] not in PUBLISH_MODES:
+        raise ValueError("无效发布方式")
     if rule["match_mode"] not in {"all", "any"}:
         raise ValueError("无效标签匹配方式")
     for key in ("start_time", "end_time"):
@@ -117,7 +149,7 @@ class AutomationManager:
         if not row:
             raise ValueError("未找到该账号，请先在独立浏览器用户配置中配对扩展。")
         result = dict(row)
-        result["rule"] = json.loads(result["rule"])
+        result["rule"] = migrate_rule(json.loads(result["rule"]))
         return result
 
     def update(self, client_id, **fields):
@@ -134,7 +166,7 @@ class AutomationManager:
             events = [dict(r) for r in con.execute("SELECT * FROM automation_events ORDER BY id DESC LIMIT 80")]
         sessions = {s["id"]: s for s in self.pool.listing()}
         for account in accounts:
-            account["rule"] = json.loads(account["rule"])
+            account["rule"] = migrate_rule(json.loads(account["rule"]))
             client = sessions.get(account["id"], {})
             account["connected"] = client.get("connected", False)
             account["detected_account"] = client.get("account", "")
@@ -181,7 +213,7 @@ class AutomationManager:
                 raise ValueError("该账号仍有操作未结束。")
             if not self.pool.connected(client_id):
                 raise ValueError("该账号的扩展连接已断开，请先重新配对。")
-            rule = validate_rule(account["rule"])
+            rule = validate_rule(migrate_rule(account["rule"]))
             if not groups(rule["tags"]) or any(not group for group in groups(rule["tags"])):
                 raise ValueError("先填写并保存这个账号的博主标签，再启动自动评论。")
             with self.lock:
@@ -199,7 +231,7 @@ class AutomationManager:
                 if duplicate:
                     raise ValueError("同一个 X 账号已在另一个连接运行，请先停止那个连接，避免重复调度。")
                 con.execute("UPDATE automation_accounts SET enabled=1,next_run=?,last_error='',status='等待执行' WHERE id=?", (time.time(), client_id))
-            self.log("已启动 @" + account["handle"] + "：仅蓝 V + 已保存的博主主页标签；自动生成并发布。")
+            self.log("已启动 @" + account["handle"] + "：仅蓝 V + 已保存的博主主页标签；" + {"auto": "自动生成并发布。", "review": "生成草稿，等你确认后发布。", "dry": "试跑，只筛选和生成，不发布。"}[rule["publish_mode"]])
         else:
             raise ValueError("未知账号操作")
 
@@ -209,6 +241,24 @@ class AutomationManager:
             self.update(client_id, last_error="", status="已检查身份：@" + handle)
         except Exception as exc:
             self.update(client_id, enabled=0, last_error=str(exc)[:400], status="身份检查失败")
+
+    def report(self, handle, mode, url, author, badge="", bio="", accepted="", reason="", post_text="", draft="", outcome=""):
+        """每日监控记录：data/reports/YYYY-MM-DD.csv（Excel 可直接打开）。"""
+        try:
+            folder = self.data / "reports"
+            folder.mkdir(exist_ok=True)
+            now = dt.datetime.now(TZ)
+            path = folder / (now.strftime("%Y-%m-%d") + ".csv")
+            new = not path.exists()
+            with self.guard, path.open("a", newline="", encoding="utf-8-sig") as fh:
+                writer = csv.writer(fh)
+                if new:
+                    writer.writerow(["时间(北京)", "运行账号", "发布方式", "帖子链接", "博主", "认证标记", "博主简介", "筛选结果", "理由", "原帖内容", "评论内容", "处理结果", "准确性(人工填写)"])
+                writer.writerow([now.strftime("%H:%M:%S"), "@" + handle, mode, url, "@" + author, badge,
+                                 str(bio).replace("\n", " ")[:500], accepted, reason,
+                                 str(post_text).replace("\n", " ")[:500], draft, outcome, ""])
+        except OSError as exc:
+            self.log("监控记录写入失败：" + str(exc)[:200])
 
     def audit(self, client_id, handle, url, profile, accepted, reason):
         with self.db() as con:
@@ -273,8 +323,8 @@ class AutomationManager:
                 # Never let any of your accounts reply to the same blogger again within the cooldown:
                 # several accounts swarming one author looks coordinated and gets reported.
                 with self.db() as con:
-                    if con.execute("SELECT 1 FROM posts WHERE lower(url) LIKE lower(?) AND status IN ('sent','sending','uncertain') AND COALESCE(published,created)>=? LIMIT 1",
-                                   ("https://x.com/" + author + "/status/%", time.time() - AUTHOR_COOLDOWN_DAYS * 86400)).fetchone():
+                    if con.execute("SELECT 1 FROM posts WHERE lower(url) LIKE lower(?) ESCAPE '\\' AND status IN ('sent','sending','uncertain') AND COALESCE(published,created)>=? LIMIT 1",
+                                   ("https://x.com/" + like_escape(author) + "/status/%", time.time() - AUTHOR_COOLDOWN_DAYS * 86400)).fetchone():
                         continue
                 # An explicit non-blue badge can be discarded without opening a profile.
                 if candidate.get("badge") in {"gold", "grey", "none"}:
@@ -288,8 +338,12 @@ class AutomationManager:
                 profile = seen_authors[author]
                 accepted, reason = match_profile(profile, rule)
                 self.audit(client_id, handle, url, profile, accepted, reason)
+                mode = rule.get("publish_mode", "auto")
                 if not accepted:
+                    self.report(handle, mode, url, author, profile.get("badge", ""), profile.get("bio", ""), "跳过", reason,
+                                candidate.get("text", ""), "", "未评论")
                     continue
+                report_base = (handle, mode, url, author, "blue", profile.get("bio", ""), "通过", reason, candidate.get("text", ""))
                 with self.db() as con:
                     inserted = con.execute("INSERT OR IGNORE INTO posts(id,url,author,text,created,status,via_account,profile_bio,badge,match_reason) VALUES(?,?,?,?,?,'generating',?,?,?,?)",
                                            (post_id, url, candidate.get("author", author), str(candidate["text"])[:12000], time.time(),
@@ -306,10 +360,21 @@ class AutomationManager:
                 draft = self.validate_draft(draft)
                 with self.db() as con:
                     duplicate = con.execute("SELECT 1 FROM posts WHERE draft=? AND status IN ('sent','sending','uncertain') LIMIT 1", (draft,)).fetchone()
-                if duplicate:
-                    self.update_post(post_id, draft=draft, status="skipped", error="与已发送的评论文字相同，已跳过")
+                    recent = [r[0] for r in con.execute("SELECT draft FROM posts WHERE status IN ('sent','sending','uncertain') AND draft<>'' ORDER BY COALESCE(published,created) DESC LIMIT 60")]
+                if duplicate or too_similar(draft, recent):
+                    self.update_post(post_id, draft=draft, status="skipped", error="与近期已发评论相同或过于相似，已跳过")
+                    self.report(*report_base, draft, "评论与近期重复/过于相似，跳过")
                     reserved = None
                     continue
+                if mode != "auto":
+                    note = "试跑模式：只筛选和生成，未发布" if mode == "dry" else "待人工确认：到“待评论”里检查后再发布"
+                    self.update_post(post_id, draft=draft, status="pending" if mode == "review" else "skipped", error=note)
+                    reserved = None
+                    self.update(client_id, status=note, last_error="")
+                    self.report(*report_base, draft, note)
+                    self.log("@" + handle + " " + note + "；@" + author + "；" + reason)
+                    sent = True
+                    break
                 if not self.still_enabled(client_id, revision):
                     self.update_post(post_id, draft=draft, status="pending", error="任务已停止，草稿保留，未发布")
                     return
@@ -319,6 +384,7 @@ class AutomationManager:
                 if not accepted:
                     self.audit(client_id, handle, url, profile, False, "发送前复查：" + reason)
                     self.update_post(post_id, draft=draft, status="skipped", error="发送前复查未通过：" + reason)
+                    self.report(*report_base, draft, "发送前复查未通过：" + reason)
                     reserved = None
                     continue
                 self.check(client_id, handle)
@@ -336,6 +402,7 @@ class AutomationManager:
                 if result.get("reply_url"):
                     reply_url, _ = self.canonical_url(result["reply_url"])
                 self.update_post(post_id, status="sent", published=time.time(), reply_url=reply_url, error="")
+                self.report(*report_base, draft, "已发布 " + reply_url)
                 reserved = None
                 self.update(client_id, status="本轮已评论 1 条，等待下个间隔", last_error="")
                 self.log("@" + handle + " 已评论 @" + author + "；" + reason)
@@ -347,6 +414,7 @@ class AutomationManager:
             message = str(exc)[:500]
             if reserved:
                 self.update_post(reserved, status="uncertain" if dispatched else "failed", error=message)
+                self.report(account["handle"], account["rule"].get("publish_mode", "auto"), reserved, "", outcome=("结果待核对：" if dispatched else "失败：") + message)
             self.update(client_id, enabled=0, status="已暂停，请检查原因后重新启动", last_error=message)
             if "X_WARNING" in message:
                 # Accounts share this machine and network; one warning means stop everything.
@@ -376,7 +444,7 @@ class AutomationManager:
                     if not self.pool.connected(client_id):
                         self.update(client_id, status="等待这个账号的扩展连接", next_run=time.time() + 10)
                         continue
-                    rule = json.loads(account["rule"])
+                    rule = migrate_rule(json.loads(account["rule"]))
                     delay = window_delay(rule)
                     if delay:
                         self.update(client_id, status="等待设定的每日运行时段（北京时间）", next_run=time.time() + delay)
