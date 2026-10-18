@@ -823,6 +823,8 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError("请先检查登录，并核对当前账号。")
                     if post["status"] not in {"pending", "failed"}:
                         raise ValueError("这条帖子的评论已发送、待发送或结果待核对，不能重复提交。")
+                    if post.get("via_account") and post["via_account"].casefold() != str(STATE["account"]).casefold():
+                        raise ValueError(f"这条草稿属于 @{post['via_account']}，请先在左侧切换到该账号再发布。")
                     update_post(post["id"], status="queued", draft=text, error="")
                     try:
                         enqueue("publish", dict(id=post["id"], text=text, account=STATE["account"]))
