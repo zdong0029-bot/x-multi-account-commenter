@@ -63,21 +63,31 @@
       const reply=target.querySelector('[data-testid="reply"]');if(!reply)throw Error('未找到回复按钮');reply.click();
       const dialog=await until(()=>Array.from(document.querySelectorAll('[role="dialog"]')).find(visible),deadline);
       const box=await until(()=>dialog.querySelector('[data-testid="tweetTextarea_0"][contenteditable="true"]'),deadline);
-      box.focus();const selection=window.getSelection(),range=document.createRange();range.selectNodeContents(box);selection.removeAllRanges();selection.addRange(range);
-      document.execCommand('insertText',false,args.text);
-      await sleep(500);
-      if(box.innerText.trim()!==args.text)throw Error('输入内容与确认文字不一致，已停止发送。可在 X 中手动检查草稿。');
+      const norm=t=>(t||'').replace(/\u00a0/g,' ').trim();
+      const selectAll=()=>{box.focus();const selection=window.getSelection(),range=document.createRange();range.selectNodeContents(box);selection.removeAllRanges();selection.addRange(range);};
+      const clear=async()=>{for(let i=0;i<3&&norm(box.innerText);i++){selectAll();document.execCommand('delete');await sleep(250);}};
+      // X 的编辑器（Draft.js）对 execCommand insertText 有时会插入两遍，先用粘贴事件，失败再退回并清空重试。
+      const attempts=[
+        ()=>{selectAll();const data=new DataTransfer();data.setData('text/plain',args.text);box.dispatchEvent(new ClipboardEvent('paste',{clipboardData:data,bubbles:true,cancelable:true}));},
+        ()=>{selectAll();document.execCommand('insertText',false,args.text);}
+      ];
+      let typed=false;
+      for(const attempt of attempts){
+        await clear();attempt();await sleep(600);
+        if(norm(box.innerText)===norm(args.text)){typed=true;break;}
+      }
+      if(!typed){await clear();throw Error('输入内容与确认文字不一致，已清空草稿并停止发送，未发出。');}
       const send=await until(()=>{const b=dialog.querySelector('[data-testid="tweetButton"]');return b&&!b.disabled&&b.getAttribute('aria-disabled')!=='true'?b:null;},deadline);
       if(account().toLowerCase()!==args.account.toLowerCase())throw Error('发送前账号发生变化，已停止。');
       if(Date.now()>deadline-5000)throw Error('确认已过期，请回助手重新操作。');
-      if(box.innerText.trim()!==args.text)throw Error('草稿被修改，已停止发送。');
+      if(norm(box.innerText)!==norm(args.text))throw Error('草稿被修改，已停止发送。');
       clicked=true;send.click();
       const end=Math.min(deadline,Date.now()+12000);
       while(Date.now()<end){
         const toast=Array.from(document.querySelectorAll('[data-testid="toast"]')).find(el=>/(Your (post|reply|Tweet) was sent|你的(帖子|回复|推文)已发送|已发[送布])/i.test(el.innerText));
         if(toast){const link=Array.from(toast.querySelectorAll('a')).find(el=>/^https:\/\/x\.com\/[A-Za-z0-9_]+\/status\/\d+/.test(el.href));return {ok:true,clicked:true,sent:true,reply_url:link?.href?.split('?')[0]||''};}
         if(!visible(dialog)){
-          const sent=extract().find(post=>post.text.trim()===args.text&&new URL(post.url||'https://x.com').pathname.startsWith('/'+args.account+'/status/')&&!post.url.endsWith('/status/'+args.id));
+          const sent=extract().find(post=>norm(post.text)===norm(args.text)&&new URL(post.url||'https://x.com').pathname.startsWith('/'+args.account+'/status/')&&!post.url.endsWith('/status/'+args.id));
           if(sent)return {ok:true,clicked:true,sent:true,reply_url:sent.url};
         }
         {const w=xWarning();if(w)throw Error('X_WARNING 已点击发送后出现风控提示：'+w);}
