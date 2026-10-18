@@ -295,7 +295,9 @@ def ai_draft(post, config, key):
                                                   profile_bio=post.get("profile_bio", ""), target_tags=post.get("target_tags", "")), ensure_ascii=False))
     ])
     request = urllib.request.Request(endpoint, data=json.dumps(payload).encode(),
-                                     headers={"Content-Type": "application/json", "Authorization": "Bearer " + key})
+                                     headers={"Content-Type": "application/json", "Authorization": "Bearer " + key,
+                                              # Cloudflare-fronted APIs reject the default Python-urllib agent (error 1010).
+                                              "User-Agent": "x-multi-account-commenter/2.0", "Accept": "application/json"})
     # Do not forward a key if an API server redirects to another endpoint.
     class NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, req, fp, code, msg, headers, newurl):
