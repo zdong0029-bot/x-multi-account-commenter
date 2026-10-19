@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import subprocess
 from contextlib import contextmanager
 import datetime as dt
 import json
@@ -151,6 +153,37 @@ class BridgePool:
             if not STATE.get("active_client"):
                 STATE["active_client"] = client_id
             return token, client_id
+
+    # 设备密钥：首次配对后发给扩展（存它自己的 chrome.storage.local），助手重启后扩展用它自动重连，不必再输配对码。
+    # 本机只保存哈希（data/devices.json），不保存明文。
+    def _devices(self):
+        try:
+            return json.loads((DATA / "devices.json").read_text("utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def issue_device_secret(self, client_id):
+        secret = secrets.token_urlsafe(32)
+        with self.mutex:
+            devices = self._devices()
+            devices[client_id] = hashlib.sha256(secret.encode()).hexdigest()
+            temp = DATA / "devices.tmp"
+            temp.write_text(json.dumps(devices), "utf-8")
+            temp.replace(DATA / "devices.json")
+        return secret
+
+    def resume(self, client_id, device_secret, extension_id, label=""):
+        with self.mutex:
+            now = time.time()
+            self.attempts = [t for t in self.attempts if now - t < 60]
+            if len(self.attempts) >= 10:
+                raise ValueError("重连尝试较多，请一分钟后重试。")
+            expected = self._devices().get(str(client_id), "")
+            given = hashlib.sha256(str(device_secret).encode()).hexdigest()
+            if not expected or not secrets.compare_digest(expected, given):
+                self.attempts.append(now)
+                raise ValueError("自动重连凭据无效，请用面板配对码重新连接一次。")
+        return self.pair(self.code, extension_id, client_id, label)
 
     def authenticate(self, token, origin):
         with self.mutex:
@@ -661,6 +694,8 @@ def snapshot():
     result["extension"] = dict(connected=BRIDGE.connected(), pair_code=BRIDGE.code,
                                path=str(ROOT / "extension"))
     result["clients"] = BRIDGE.listing()
+    result["profiles"] = PROFILES.listing()
+    result["launching"] = LAUNCHER.busy
     result["automation"] = AUTOMATION.snapshot()
     if result["config"].get("browser_mode") == "extension" and not BRIDGE.connected():
         result.update(logged_in=False, browser=False)
@@ -709,6 +744,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/":
             page = (ROOT / "index.html").read_text("utf-8").replace("__TOKEN__", TOKEN)
             return self.reply(page.encode("utf-8"), content_type="text/html; charset=utf-8")
+        if self.path.startswith("/setup?"):
+            key = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("k", [""])[0]
+            profile = PROFILES.setup_info(key)
+            if not profile:
+                return self.reply("<p>链接已过期，请回助手面板重新打开这个账号。</p>".encode("utf-8"), 403, "text/html; charset=utf-8")
+            return self.reply(setup_page(profile).encode("utf-8"), content_type="text/html; charset=utf-8")
         if not self.authorized():
             return self.reply(dict(error="请从本机助手页面操作"), 403)
         if self.path == "/api/state":
@@ -739,7 +780,16 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("扩展来源不一致")
                 token, client_id = BRIDGE.pair(args.get("code", ""), extension_id, args.get("client_id", ""), args.get("label", ""))
                 AUTOMATION.register(client_id, args.get("label", ""))
+                PROFILES.link(args.get("profile", ""), client_id)
                 log("浏览器扩展已加入账号列表，请检查连接并设置该账号规则。")
+                return self.reply(dict(ok=True, token=token, client_id=client_id, device_secret=BRIDGE.issue_device_secret(client_id)))
+            if self.path == "/bridge/resume":
+                extension_id = args.get("extension_id", "")
+                if origin and origin != "chrome-extension://" + extension_id:
+                    raise ValueError("扩展来源不一致")
+                token, client_id = BRIDGE.resume(args.get("client_id", ""), args.get("device_secret", ""), extension_id, args.get("label", ""))
+                AUTOMATION.register(client_id, args.get("label", ""))
+                log("浏览器扩展已自动重连：" + (args.get("label") or client_id[:8]))
                 return self.reply(dict(ok=True, token=token, client_id=client_id))
             session = BRIDGE.authenticate(self.headers.get("X-Bridge-Token", ""), origin)
             if not session:
@@ -768,6 +818,12 @@ class Handler(BaseHTTPRequestHandler):
             action = self.path.removeprefix("/api/")
             if action.startswith("account_"):
                 AUTOMATION.action(action, args)
+            elif action == "add_profile":
+                PROFILES.add(args.get("label", ""))
+            elif action == "launch_profile":
+                PROFILES.launch(str(args.get("id", "")))
+            elif action == "launch_all":
+                LAUNCHER.start_all()
             elif action == "select_client":
                 with LOCK:
                     if STATE["busy"] or not TASKS.empty():
@@ -873,6 +929,158 @@ class LocalServer(ThreadingHTTPServer):
         super().server_bind()
 
 
+def find_browser():
+    candidates = [Path(os.environ.get("PROGRAMFILES", "C:/Program Files")) / "Google/Chrome/Application/chrome.exe",
+                  Path(os.environ.get("PROGRAMFILES(X86)", "C:/Program Files (x86)")) / "Google/Chrome/Application/chrome.exe",
+                  Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
+                  Path(os.environ.get("PROGRAMFILES(X86)", "C:/Program Files (x86)")) / "Microsoft/Edge/Application/msedge.exe",
+                  Path(os.environ.get("PROGRAMFILES", "C:/Program Files")) / "Microsoft/Edge/Application/msedge.exe"]
+    for path in candidates:
+        if str(path) and path.is_file():
+            return path
+    raise ValueError("没有找到 Chrome 或 Edge，请先安装 Chrome。")
+
+
+class ProfileManager:
+    """助手管理的独立浏览器配置：每个 X 账号一个 data/profiles/<id> 目录。
+    只负责打开窗口；登录由用户在窗口里手动完成，助手不读密码、不导出 Cookie。"""
+
+    def __init__(self):
+        self.mutex = threading.RLock()
+        self.setup_keys = {}  # 一次性 key -> (profile_id, 过期时间)，只用于新窗口里的自动配对页
+        self.port = 18865
+
+    def _load(self):
+        try:
+            data = json.loads((DATA / "profiles.json").read_text("utf-8"))
+            return data if isinstance(data, list) else []
+        except (OSError, ValueError):
+            return []
+
+    def _save(self, items):
+        temp = DATA / "profiles.tmp"
+        temp.write_text(json.dumps(items, ensure_ascii=False, indent=2), "utf-8")
+        temp.replace(DATA / "profiles.json")
+
+    def listing(self):
+        with self.mutex:
+            return self._load()
+
+    def add(self, label):
+        label = str(label).strip()[:60]
+        if not label:
+            raise ValueError("请先给新账号写个备注，例如：AI 工具号 2。")
+        find_browser()
+        with self.mutex:
+            items = self._load()
+            profile_id = "p" + secrets.token_hex(4)
+            items.append(dict(id=profile_id, label=label, client_id="", created=time.time()))
+            self._save(items)
+        self.launch(profile_id, first=True)
+        return profile_id
+
+    def link(self, profile_id, client_id):
+        profile_id = str(profile_id or "")
+        if not re.fullmatch(r"p[0-9a-f]{8}", profile_id):
+            return
+        with self.mutex:
+            items = self._load()
+            for item in items:
+                if item["id"] == profile_id:
+                    item["client_id"] = client_id
+            self._save(items)
+
+    def setup_info(self, key):
+        with self.mutex:
+            now = time.time()
+            self.setup_keys = {k: v for k, v in self.setup_keys.items() if v[1] > now}
+            entry = self.setup_keys.get(str(key))
+        if not entry:
+            return None
+        profile = next((p for p in self.listing() if p["id"] == entry[0]), None)
+        return profile
+
+    def launch(self, profile_id, first=False):
+        profile = next((p for p in self.listing() if p["id"] == profile_id), None)
+        if not profile:
+            raise ValueError("未找到这个账号的浏览器配置。")
+        browser = find_browser()
+        folder = DATA / "profiles" / profile_id
+        folder.mkdir(parents=True, exist_ok=True)
+        key = secrets.token_urlsafe(18)
+        with self.mutex:
+            self.setup_keys[key] = (profile_id, time.time() + 900)
+        setup = f"http://127.0.0.1:{self.port}/setup?k={key}"
+        args = [str(browser), "--user-data-dir=" + str(folder), "--no-first-run", "--no-default-browser-check",
+                "--load-extension=" + str(ROOT / "extension"),
+                "--disable-features=DisableLoadExtensionCommandLineSwitch",
+                "https://x.com/login" if first else "https://x.com/home", setup]
+        subprocess.Popen(args, close_fds=True)
+        log(("已为「" + profile["label"] + "」打开新的独立浏览器，请在窗口里登录 X。") if first else ("已打开「" + profile["label"] + "」的浏览器。"))
+
+
+PROFILES = ProfileManager()
+
+
+def setup_page(profile):
+    label = html_escape(profile["label"])
+    return f"""<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>X 评论助手 · 账号设置</title>
+<meta name="x-assistant-pair" content="{BRIDGE.code}" data-profile="{profile['id']}" data-label="{label}">
+<style>body{{max-width:640px;margin:10vh auto;padding:28px;font:15px/1.9 'Segoe UI','Microsoft YaHei',sans-serif;background:#f5f5ee;color:#202827}}.box{{background:#fff;border:1px solid #dbe0d4;border-radius:16px;padding:30px}}code{{background:#eef1e8;padding:2px 6px;border-radius:5px}}#state{{padding:12px;background:#eaf0e0;border-radius:8px}}</style>
+<div class="box"><h2>账号「{label}」的独立浏览器</h2><div id="state">等待扩展自动连接…</div>
+<p>1. 在旁边的 X 标签页登录这个账号（助手不会读取密码）。<br>2. 登录后回到助手面板，点这个账号的「检查身份」，保存规则后启动。</p>
+<p>如果几秒后这里仍显示“等待扩展自动连接”，说明浏览器没自动加载扩展，只需做一次：地址栏打开 <code>chrome://extensions</code> → 打开「开发者模式」→「加载已解压的扩展程序」→ 选择 <code>{html_escape(str(ROOT / 'extension'))}</code>，然后刷新本页。</p></div></html>"""
+
+
+def html_escape(value):
+    return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+class Launcher:
+    """一键启动：打开全部独立浏览器 → 等扩展自动重连 → 核对身份 → 按已保存规则启动。"""
+
+    def __init__(self):
+        self.busy = False
+
+    def start_all(self):
+        if self.busy:
+            raise ValueError("一键启动正在进行，请稍候。")
+        self.busy = True
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        try:
+            for profile in PROFILES.listing():
+                if profile.get("client_id") and BRIDGE.connected(profile["client_id"]):
+                    continue
+                try:
+                    PROFILES.launch(profile["id"])
+                except Exception as exc:
+                    log("打开「" + profile["label"] + "」失败：" + str(exc)[:200])
+                time.sleep(3)
+            deadline = time.time() + 120
+            pending = {a["id"] for a in AUTOMATION.snapshot()["accounts"] if not a["enabled"]}
+            while pending and time.time() < deadline and not STOP.is_set():
+                for account in AUTOMATION.snapshot()["accounts"]:
+                    if account["id"] not in pending or not account["connected"]:
+                        continue
+                    pending.discard(account["id"])
+                    AUTOMATION.autostart(account["id"])
+                time.sleep(2)
+            for client_id in pending:
+                try:
+                    account = AUTOMATION.record(client_id)
+                    AUTOMATION.update(client_id, status="一键启动：2 分钟内未连上，请检查这个账号的浏览器窗口")
+                except Exception:
+                    pass
+            log("一键启动完成，各账号状态见下方。")
+        finally:
+            self.busy = False
+
+
+LAUNCHER = Launcher()
+
+
 from automation import AutomationManager
 AUTOMATION = AutomationManager(db=db, pool=BRIDGE, state=STATE, lock=LOCK, stop=STOP,
                                log=log, ai_draft=ai_draft, validate_draft=validate_draft,
@@ -897,6 +1105,7 @@ def main():
     worker = threading.Thread(target=BrowserWorker().run, daemon=True)
     worker.start()
     AUTOMATION.start()
+    PROFILES.port = server.server_port
     url = f"http://127.0.0.1:{server.server_port}"
     (DATA / "server.json").write_text(json.dumps(dict(url=url, pid=os.getpid())), "utf-8")
     log("多账号助手已就绪。分别连接账号，核对身份、保存各自的博主标签和间隔后，可独立启动自动评论。")

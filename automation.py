@@ -237,6 +237,20 @@ class AutomationManager:
         else:
             raise ValueError("未知账号操作")
 
+    def autostart(self, client_id):
+        """一键启动用：核对身份（与上次记录的账号一致）后，按已保存的规则启动；不满足条件就只写状态，不硬启动。"""
+        try:
+            account = self.record(client_id)
+            if account["enabled"] or client_id in self.running:
+                return
+            handle = self.check(client_id, expected=account["handle"] or None)
+            if not account["revision"]:
+                self.update(client_id, last_error="", status="已核对身份 @" + handle + "；请保存这个账号的规则后再启动")
+                return
+            self.action("account_run", dict(id=client_id, enabled=True))
+        except Exception as exc:
+            self.update(client_id, enabled=0, last_error=str(exc)[:400], status="一键启动未完成")
+
     def check_task(self, client_id):
         try:
             handle = self.check(client_id)
