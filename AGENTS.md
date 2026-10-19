@@ -19,6 +19,7 @@ X 多账号评论助手。Windows 本机运行：`app.py` 是 127.0.0.1 上的�
 8. 本机服务只监听 127.0.0.1，保留 Host/Origin/令牌校验和扩展配对校验。
 
 ## 约定
+- 多账号：`ProfileManager` 在 `data/profiles/<id>` 为每个账号建独立浏览器配置（`data/profiles.json` 记录备注和 client_id），用户在窗口里手动登录；`/setup?k=` 一次性页面让扩展自动配对。扩展首次配对后拿到设备密钥（本机只存哈希 `data/devices.json`），之后助手/浏览器重启用 `/bridge/resume` 自动重连。「一键启动」= 打开全部配置 → 等重连 → 核对身份与上次一致 → 按已保存规则启动；身份不符或规则未保存则不启动。
 - 界面和日志用中文，时间用北京时间（`automation.TZ`）。
 - 博主筛选只依据主页简介/公开分类，不依据帖子内容推断。
 - 新的规则字段要同时加到 `DEFAULT_RULE`、`validate_rule`、`migrate_rule`（如需）和 `index.html` 的 `automationMarkup`（`data-rule="字段名"`）。
