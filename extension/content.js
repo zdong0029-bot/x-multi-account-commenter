@@ -3,13 +3,24 @@
   globalThis.__xCommentAssistantInstalled=true;
   const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
   const visible=el=>!!el&&el.getClientRects().length>0;
-  async function until(getter,deadline,ms=15000,what=''){const end=Math.min(deadline,Date.now()+ms);while(Date.now()<end){const value=getter();if(value)return value;await sleep(180);}throw Error('未找到页面控件'+(what?'（'+what+'）':'')+'，请确认 X 已加载且当前账号有权操作。[扩展 2.0.4]');}
-  // 当前登录账号：先看左侧“个人资料”链接，窗口较窄/布局变化时再看左下角账号切换按钮里的 @用户名。
-  function account(){
+  async function until(getter,deadline,ms=15000,what=''){const end=Math.min(deadline,Date.now()+ms);while(Date.now()<end){const value=getter();if(value)return value;await sleep(180);}throw Error('未找到页面控件'+(what?'（'+what+'）':'')+'，请确认 X 已加载且当前账号有权操作。[扩展 2.1.1]');}
+  // 当前登录账号：先看左侧“个人资料”链接，再看左下角账号切换按钮里的 @用户名。
+  // 窗口窄、被最小化或 X 改版时这两个控件都可能不渲染，所以再用本窗口自己的登录会话编号（twid）兜底：
+  // 在首页“检查身份”成功时记下 @用户名 ↔ 会话编号，发帖标签页里只要编号一致就认为是同一账号。只读本站点的编号，不导出 Cookie。
+  function domAccount(){
     const link=(document.querySelector('a[data-testid="AppTabBar_Profile_Link"]')?.getAttribute('href')||'').replace(/^\/+|\/+$/g,'');
     if(/^[A-Za-z0-9_]{1,15}$/.test(link))return link;
     const m=(document.querySelector('[data-testid="SideNav_AccountSwitcher_Button"]')?.innerText||'').match(/@([A-Za-z0-9_]{1,15})/);
     return m?m[1]:'';
+  }
+  function sessionId(){const m=document.cookie.match(/(?:^|;\s*)twid=([^;]+)/);if(!m)return '';const v=decodeURIComponent(m[1]).replace(/^"|"$/g,'');const id=v.match(/u=(\d+)/);return id?id[1]:'';}
+  let known={};
+  async function loadKnown(){try{known=(await chrome.storage.local.get('xAccounts')).xAccounts||{};}catch(e){known={};}}
+  async function remember(handle){const id=sessionId();if(!handle||!id||known[handle.toLowerCase()]===id)return;known[handle.toLowerCase()]=id;try{await chrome.storage.local.set({xAccounts:known});}catch(e){}}
+  function account(expected){
+    const dom=domAccount();if(dom)return dom;
+    if(expected){const id=sessionId();if(id&&known[String(expected).toLowerCase()]===id)return expected;}
+    return '';
   }
   function loginError(){const text=document.body.innerText;if(/(temporarily limited your login|临时限制你的登录|臨時限制你的登入)/i.test(text))throw Error('X 暂时限制了这次登录。请停止重复尝试，继续使用原本已登录的标签页。');}
   // X risk-control signals. Seen in toasts, alerts, dialogs or the account-access pages.
@@ -35,8 +46,11 @@
     let clicked=false;
     try{
       {const w=xWarning();if(w)throw Error('X_WARNING '+w);}
-      if(!account())loginError();
-      await until(()=>account(),deadline,25000,'当前登录账号；请把这个 Chrome 窗口放大到 1000 像素以上宽度');
+      await loadKnown();
+      const expected=command==='publish'?args.account:'';
+      if(!account(expected))loginError();
+      await until(()=>account(expected),deadline,25000,expected&&!known[String(expected).toLowerCase()]?'当前登录账号；请回面板对这个账号点一次“检查身份”后再发布':'当前登录账号；请把这个 Chrome 窗口放大到 1000 像素以上宽度');
+      if(domAccount())await remember(domAccount());
       if(command==='info')return {ok:true,account:account()};
       if(command==='profile'){
         if(location.pathname.replace(/^\/+|\/+$/g,'').toLowerCase()!==String(args.handle).toLowerCase())throw Error('主页地址与待核对的博主不一致');
@@ -64,7 +78,7 @@
         return {ok:true,posts:extract()};
       }
       if(command!=='publish')throw Error('不支持的操作');
-      if(account().toLowerCase()!==args.account.toLowerCase())throw Error('X 当前账号与确认发布时不同，已停止。');
+      if(account(args.account).toLowerCase()!==args.account.toLowerCase())throw Error('X 当前账号与确认发布时不同，已停止。');
       const target=await until(()=>Array.from(document.querySelectorAll('article[data-testid="tweet"]')).find(el=>Array.from(el.querySelectorAll('a:has(time)')).some(link=>new URL(link.href).pathname.endsWith('/status/'+args.id))),deadline,20000,'原帖');
       {const w=xWarning();if(w)throw Error('X_WARNING '+w);}
       const editable='[data-testid="tweetTextarea_0"][contenteditable="true"]';
@@ -95,7 +109,7 @@
       }
       if(!typed){await clear();throw Error('输入内容与确认文字不一致，已清空草稿并停止发送，未发出。');}
       const send=await until(()=>{const b=dialog.querySelector('[data-testid="'+composer.button+'"]')||dialog.querySelector('[data-testid="tweetButton"],[data-testid="tweetButtonInline"]');return b&&!b.disabled&&b.getAttribute('aria-disabled')!=='true'?b:null;},deadline,15000,'发送按钮');
-      if(account().toLowerCase()!==args.account.toLowerCase())throw Error('发送前账号发生变化，已停止。');
+      if(account(args.account).toLowerCase()!==args.account.toLowerCase())throw Error('发送前账号发生变化，已停止。');
       if(Date.now()>deadline-5000)throw Error('确认已过期，请回助手重新操作。');
       if(norm(box.innerText)!==norm(args.text))throw Error('草稿被修改，已停止发送。');
       clicked=true;send.click();
