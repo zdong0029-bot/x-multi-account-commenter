@@ -47,7 +47,12 @@ async function execute(job){
       if(kind==='profile'&&!/^[A-Za-z0-9_]{1,15}$/.test(args.handle||''))throw Error('博主账号不正确');
       const url=checkedURL(kind==='profile'?'https://x.com/'+args.handle:args.url);
       if(kind!=='profile'&&!/^\/[A-Za-z0-9_]{1,15}\/status\/\d+$/.test(new URL(url).pathname))throw Error('帖子链接不正确');
-      operationTab=await chrome.tabs.create({url:'about:blank',active:kind==='publish'});
+      // 发帖标签页开在本账号已连接的那个窗口里；窗口被最小化或太窄时 X 会换成手机布局、不渲染回复框，先恢复成正常大小。
+      let windowId;try{windowId=(await chrome.tabs.get(connection.tabId)).windowId;}catch(e){}
+      if(kind==='publish'&&windowId!==undefined){try{const w=await chrome.windows.get(windowId);
+        if(w.state==='minimized')await chrome.windows.update(windowId,{state:'normal'});
+        if(w.state==='normal'&&(w.width||0)<1100)await chrome.windows.update(windowId,{width:1280,height:Math.max(w.height||0,900)});}catch(e){}}
+      operationTab=await chrome.tabs.create({url:'about:blank',active:kind==='publish',...(windowId!==undefined?{windowId}:{})});
       // Let the browser finish creating the tab before navigating and injecting.
       await sleep(250);
       await chrome.tabs.update(operationTab.id,{url});
