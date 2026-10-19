@@ -3,7 +3,7 @@
   globalThis.__xCommentAssistantInstalled=true;
   const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
   const visible=el=>!!el&&el.getClientRects().length>0;
-  async function until(getter,deadline,ms=15000){const end=Math.min(deadline,Date.now()+ms);while(Date.now()<end){const value=getter();if(value)return value;await sleep(180);}throw Error('未找到页面控件，请确认 X 已加载且当前账号有权操作。');}
+  async function until(getter,deadline,ms=15000,what=''){const end=Math.min(deadline,Date.now()+ms);while(Date.now()<end){const value=getter();if(value)return value;await sleep(180);}throw Error('未找到页面控件'+(what?'（'+what+'）':'')+'，请确认 X 已加载且当前账号有权操作。');}
   function account(){return (document.querySelector('a[data-testid="AppTabBar_Profile_Link"]')?.getAttribute('href')||'').replace(/^\/+|\/+$/g,'');}
   function loginError(){const text=document.body.innerText;if(/(temporarily limited your login|临时限制你的登录|臨時限制你的登入)/i.test(text))throw Error('X 暂时限制了这次登录。请停止重复尝试，继续使用原本已登录的标签页。');}
   // X risk-control signals. Seen in toasts, alerts, dialogs or the account-access pages.
@@ -59,10 +59,21 @@
       }
       if(command!=='publish')throw Error('不支持的操作');
       if(account().toLowerCase()!==args.account.toLowerCase())throw Error('X 当前账号与确认发布时不同，已停止。');
-      const target=await until(()=>Array.from(document.querySelectorAll('article[data-testid="tweet"]')).find(el=>Array.from(el.querySelectorAll('a:has(time)')).some(link=>new URL(link.href).pathname.endsWith('/status/'+args.id))),deadline);
-      const reply=target.querySelector('[data-testid="reply"]');if(!reply)throw Error('未找到回复按钮');reply.click();
-      const dialog=await until(()=>Array.from(document.querySelectorAll('[role="dialog"]')).find(visible),deadline);
-      const box=await until(()=>dialog.querySelector('[data-testid="tweetTextarea_0"][contenteditable="true"]'),deadline);
+      const target=await until(()=>Array.from(document.querySelectorAll('article[data-testid="tweet"]')).find(el=>Array.from(el.querySelectorAll('a:has(time)')).some(link=>new URL(link.href).pathname.endsWith('/status/'+args.id))),deadline,20000,'原帖');
+      {const w=xWarning();if(w)throw Error('X_WARNING '+w);}
+      const editable='[data-testid="tweetTextarea_0"][contenteditable="true"]';
+      // 优先用原帖下方的内联回复框；没有时再点回复按钮打开弹窗。X 有时会叠加其它 role=dialog 的提示层，所以只认含编辑框的弹窗。
+      const inlineBox=()=>{const b=Array.from(document.querySelectorAll('[data-testid="primaryColumn"] '+editable)).find(el=>visible(el)&&!el.closest('[role="dialog"]'));return b?{box:b,root:b.closest('[data-testid="primaryColumn"]'),button:'tweetButtonInline'}:null;};
+      const dialogBox=()=>{for(const d of Array.from(document.querySelectorAll('[role="dialog"]')).filter(visible)){const b=d.querySelector(editable);if(b&&visible(b))return {box:b,root:d,button:'tweetButton'};}return null;};
+      let composer=await until(()=>inlineBox()||dialogBox(),deadline,4000,'').catch(()=>null);
+      if(!composer){
+        const reply=target.querySelector('[data-testid="reply"]');if(!reply)throw Error('未找到回复按钮（可能该帖限制了回复）');
+        if(reply.getAttribute('aria-disabled')==='true'||reply.disabled)throw Error('该帖作者限制了谁可以回复，已跳过。');
+        reply.click();
+        composer=await until(()=>dialogBox()||inlineBox(),deadline,12000,'回复编辑框');
+      }
+      const box=composer.box,dialog=composer.root;
+      box.click();box.focus();await sleep(300);
       const norm=t=>(t||'').replace(/\u00a0/g,' ').trim();
       const selectAll=()=>{box.focus();const selection=window.getSelection(),range=document.createRange();range.selectNodeContents(box);selection.removeAllRanges();selection.addRange(range);};
       const clear=async()=>{for(let i=0;i<3&&norm(box.innerText);i++){selectAll();document.execCommand('delete');await sleep(250);}};
@@ -77,7 +88,7 @@
         if(norm(box.innerText)===norm(args.text)){typed=true;break;}
       }
       if(!typed){await clear();throw Error('输入内容与确认文字不一致，已清空草稿并停止发送，未发出。');}
-      const send=await until(()=>{const b=dialog.querySelector('[data-testid="tweetButton"]');return b&&!b.disabled&&b.getAttribute('aria-disabled')!=='true'?b:null;},deadline);
+      const send=await until(()=>{const b=dialog.querySelector('[data-testid="'+composer.button+'"]')||dialog.querySelector('[data-testid="tweetButton"],[data-testid="tweetButtonInline"]');return b&&!b.disabled&&b.getAttribute('aria-disabled')!=='true'?b:null;},deadline,15000,'发送按钮');
       if(account().toLowerCase()!==args.account.toLowerCase())throw Error('发送前账号发生变化，已停止。');
       if(Date.now()>deadline-5000)throw Error('确认已过期，请回助手重新操作。');
       if(norm(box.innerText)!==norm(args.text))throw Error('草稿被修改，已停止发送。');
@@ -86,7 +97,7 @@
       while(Date.now()<end){
         const toast=Array.from(document.querySelectorAll('[data-testid="toast"]')).find(el=>/(Your (post|reply|Tweet) was sent|你的(帖子|回复|推文)已发送|已发[送布])/i.test(el.innerText));
         if(toast){const link=Array.from(toast.querySelectorAll('a')).find(el=>/^https:\/\/x\.com\/[A-Za-z0-9_]+\/status\/\d+/.test(el.href));return {ok:true,clicked:true,sent:true,reply_url:link?.href?.split('?')[0]||''};}
-        if(!visible(dialog)){
+        if(!visible(dialog)||(composer.button==='tweetButtonInline'&&!norm(box.innerText))){
           const sent=extract().find(post=>norm(post.text)===norm(args.text)&&new URL(post.url||'https://x.com').pathname.startsWith('/'+args.account+'/status/')&&!post.url.endsWith('/status/'+args.id));
           if(sent)return {ok:true,clicked:true,sent:true,reply_url:sent.url};
         }
