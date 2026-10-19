@@ -211,12 +211,18 @@ with db() as con:
     for name in ("via_account", "profile_bio", "badge", "match_reason"):
         if name not in columns:
             con.execute(f"ALTER TABLE posts ADD COLUMN {name} TEXT DEFAULT ''")
+KEY_FILE = DATA / "ai_key.txt"  # 只存在本机 data/（已被 .gitignore 忽略），不会推到 GitHub
+try:
+    AI_KEY = KEY_FILE.read_text("utf-8").strip() if KEY_FILE.exists() else ""
+except OSError:
+    AI_KEY = ""
 if (DATA / "config.json").exists():
     try:
         with LOCK:
             STATE["config"].update({k: v for k, v in json.loads((DATA / "config.json").read_text("utf-8")).items() if k in DEFAULTS})
     except (ValueError, OSError):
         pass
+STATE["ai_ready"] = bool(AI_KEY and STATE["config"].get("base_url") and STATE["config"].get("model"))
 # A browser crash after a click must never cause an automatic second publication.
 with db() as con:
     con.execute("UPDATE posts SET status='uncertain', error='上次发布被中断，请在 X 检查是否已发送。' WHERE status='sending'")
@@ -787,8 +793,10 @@ class Handler(BaseHTTPRequestHandler):
                         config[field] = str(config[field])[:2000]
                     if "api_key" in args and args["api_key"]:
                         AI_KEY = str(args["api_key"]).strip()
+                        KEY_FILE.write_text(AI_KEY, "utf-8")
                     if args.get("clear_key"):
                         AI_KEY = ""
+                        KEY_FILE.unlink(missing_ok=True)
                     STATE.update(config=config, ai_ready=bool(AI_KEY and config["base_url"] and config["model"]))
                     temp = DATA / "config.tmp"
                     temp.write_text(json.dumps(config, ensure_ascii=False, indent=2), "utf-8")
