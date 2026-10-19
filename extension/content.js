@@ -3,8 +3,14 @@
   globalThis.__xCommentAssistantInstalled=true;
   const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
   const visible=el=>!!el&&el.getClientRects().length>0;
-  async function until(getter,deadline,ms=15000,what=''){const end=Math.min(deadline,Date.now()+ms);while(Date.now()<end){const value=getter();if(value)return value;await sleep(180);}throw Error('未找到页面控件'+(what?'（'+what+'）':'')+'，请确认 X 已加载且当前账号有权操作。');}
-  function account(){return (document.querySelector('a[data-testid="AppTabBar_Profile_Link"]')?.getAttribute('href')||'').replace(/^\/+|\/+$/g,'');}
+  async function until(getter,deadline,ms=15000,what=''){const end=Math.min(deadline,Date.now()+ms);while(Date.now()<end){const value=getter();if(value)return value;await sleep(180);}throw Error('未找到页面控件'+(what?'（'+what+'）':'')+'，请确认 X 已加载且当前账号有权操作。[扩展 2.0.4]');}
+  // 当前登录账号：先看左侧“个人资料”链接，窗口较窄/布局变化时再看左下角账号切换按钮里的 @用户名。
+  function account(){
+    const link=(document.querySelector('a[data-testid="AppTabBar_Profile_Link"]')?.getAttribute('href')||'').replace(/^\/+|\/+$/g,'');
+    if(/^[A-Za-z0-9_]{1,15}$/.test(link))return link;
+    const m=(document.querySelector('[data-testid="SideNav_AccountSwitcher_Button"]')?.innerText||'').match(/@([A-Za-z0-9_]{1,15})/);
+    return m?m[1]:'';
+  }
   function loginError(){const text=document.body.innerText;if(/(temporarily limited your login|临时限制你的登录|臨時限制你的登入)/i.test(text))throw Error('X 暂时限制了这次登录。请停止重复尝试，继续使用原本已登录的标签页。');}
   // X risk-control signals. Seen in toasts, alerts, dialogs or the account-access pages.
   const WARN=/(rate limit|over the daily limit|looks like it might be automated|unusual activity|account (is|has been) (temporarily )?(locked|restricted|suspended)|verify (you are|you're) human|complete a challenge|异常活动|看起来像是自动|已被锁定|已被冻结|已被限制|暂时受限|超出.{0,6}限制|完成验证)/i;
@@ -30,7 +36,7 @@
     try{
       {const w=xWarning();if(w)throw Error('X_WARNING '+w);}
       if(!account())loginError();
-      await until(()=>account(),deadline,12000);
+      await until(()=>account(),deadline,25000,'当前登录账号；请把这个 Chrome 窗口放大到 1000 像素以上宽度');
       if(command==='info')return {ok:true,account:account()};
       if(command==='profile'){
         if(location.pathname.replace(/^\/+|\/+$/g,'').toLowerCase()!==String(args.handle).toLowerCase())throw Error('主页地址与待核对的博主不一致');
